@@ -1,0 +1,270 @@
+---
+title: "ASSIGNMENT IML"
+output: html_document
+date: "2024-03-30"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+	echo = TRUE,
+	message = FALSE,
+	warning = FALSE
+)
+```
+
+  Let Load the relevant packages the credit-g data and create the corresponding task.
+```{r}
+library(mlr3)
+library(mlr3learners)
+library(mlr3tuning)
+library(OpenML)
+library(mlr3pipelines)
+library(future)
+library(tidyverse)
+future::plan("multisession") 
+
+# load credit-g data and define task
+credit_data = getOMLDataSet(data.id = 31)
+task = as_task_classif(credit_data$data, target = "class") 
+```
+We will use a Random Forest from the ranger package as learner with the following settings.
+
+```{r}
+lrn_ranger <- lrn("classif.ranger",
+    mtry.ratio = to_tune(0.1, 1),
+    min.node.size = to_tune(1, 50),
+    predict_type = "prob"
+    )
+
+```
+
+To compare different encoding strategies, define five different graphs:
+dummy encoding %>>% Random Fores learner
+target encoding %>>% Random Fores learner (use po("encodeimpact"))
+Random Fores learner where target encoding is done within the ranger package (respect.unordered.factors = "order")
+Random Fores learner where target encoding is done within the ranger package and before every split (respect.unordered.factors = "partition")
+glmm encoding %>>% Random Fores learner (use po("encodelmer"))
+
+```{r}
+graph_dummy = (
+  po("encode", method="treatment", affect_columns=selector_type("factor")) %>>%
+    po("scale", affect_columns=selector_type("numeric")) %>>%
+    lrn_ranger
+) %>% 
+  as_learner() %>% 
+  auto_tuner(
+    tuner = tnr("random_search", batch_size=25),
+    learner = .,
+    resampling = rsmp("cv", folds=5),
+    measure = msr("classif.ce"),
+    terminator = trm("evals", n_evals=50)
+  )
+graph_dummy$id="dummy_enco"
+
+
+
+###########################
+
+graph_target_enco = (
+  po("encodeimpact") %>>%
+    po("scale", affect_columns=selector_type("numeric")) %>>%
+    lrn_ranger
+) %>% 
+  as_learner() %>% 
+  auto_tuner(
+    tuner = tnr("random_search", batch_size=25),
+    learner = .,
+    resampling = rsmp("cv", folds=5),
+    measure = msr("classif.ce"),
+    terminator = trm("evals", n_evals=50)
+  )
+
+graph_target_enco$id="target_enco_impact"
+#########################
+
+
+graph_target_enco_order = (
+    po("scale", affect_columns=selector_type("numeric")) %>>%
+    lrn("classif.ranger",
+    mtry.ratio = to_tune(0.1, 1),
+    min.node.size = to_tune(1, 50),
+    predict_type = "prob",
+    respect.unordered.factors = "order"
+    )
+) %>% 
+  as_learner() %>% 
+  auto_tuner(
+    tuner = tnr("random_search", batch_size=25),
+    learner = .,
+    resampling = rsmp("cv", folds=5),
+    measure = msr("classif.ce"),
+    terminator = trm("evals", n_evals=50)
+  )
+
+graph_target_enco_order$id="target_enco_order"
+
+##########################
+
+
+graph_target_enco_partition = (
+    po("scale", affect_columns=selector_type("numeric")) %>>%
+    lrn("classif.ranger",
+    mtry.ratio = to_tune(0.1, 1),
+    min.node.size = to_tune(1, 50),
+    predict_type = "prob",
+    respect.unordered.factors = "partition"
+    )
+) %>% 
+  as_learner() %>% 
+  auto_tuner(
+    tuner = tnr("random_search", batch_size=25),
+    learner = .,
+    resampling = rsmp("cv", folds=5),
+    measure = msr("classif.ce"),
+    terminator = trm("evals", n_evals=50)
+  )
+
+graph_target_enco_partition$id="target_enco_partition"
+
+###############################
+
+
+
+graph_target_glmm = (
+  po("encodelmer") %>>%
+    po("scale", affect_columns=selector_type("numeric")) %>>%
+    lrn_ranger
+) %>% 
+  as_learner() %>% 
+  auto_tuner(
+    tuner = tnr("random_search", batch_size=25),
+    learner = .,
+    resampling = rsmp("cv", folds=5),
+    measure = msr("classif.ce"),
+    terminator = trm("evals", n_evals=50)
+  )
+graph_target_glmm$id="glmm"
+```
+
+
+
+Run a nested cross validation for each graph where
+the inner CV (hyperparameter tuning) runs 5-fold CV with random search and 50 evaluations
+the outer CV runs 3-fold CV
+Measure the computational time it takes to run nested cross validation for each of the five graphs.
+
+
+```{r}
+bm_design = benchmark_grid(
+  tasks = list(task),
+  learners = list(dummy_enco = graph_dummy,
+                  mlr3_target_enco= graph_target_enco,
+                  ranger_target_enco_order = graph_target_enco_order,
+                  ranger_target_enco_partition= graph_target_enco_partition,
+                  glmm_encoding=graph_target_glmm
+                  ),
+  resamplings=list(rsmp("cv", folds=3))
+)
+
+bm = benchmark(
+  design = bm_design
+)
+```
+
+
+```{r}
+measured <- list(msr("classif.acc"),msr("classif.ce"),msr("time_train"),msr("time_predict"))
+bm$aggregate(measured)
+
+
+
+```
+
+
+```{r}
+autoplot(bm)
+```
+
+
+##### Comment:
+
+We can see that the predictive performance of each of them are in the same range but the glmm seem to be better .
+
+In term of computational time , we can see from the data.table  that glmm takes 1239.9300 seconds to train and 0.3566667 to predict. Of course the time depends on the computer but we can see that glmm is the most expensive in computational time follown by target encoding done in the rpart package with partiton before split. The data table above give a good ways to compare.
+
+# Come up with our own encoding strategy
+
+
+I decide to implement the frequency encoding strategy.It done by replacing the label of categorical feature by their frequency in the dataset.
+
+It has some advantages and also some challenges.
+
+It very good for features that have high cardinality( number of label bigger than 3, there is no general threshold to qualify high cardinality).
+
+One challenge is that if two label have the same frequency the model will see them as once, what is not good.
+
+
+
+Let implement!!
+```{r}
+library(data.table)
+frequency_encode <- function(task) {
+  
+  task_clone<-task$clone()
+  data<-task_clone$data()
+  for(name in task$feature_types$id[task$feature_types$type=='factor']){
+  freq_table <- data[, .N, by = name]
+  data <- merge(data, freq_table, by = name, all.x = TRUE)
+  setnames(data, "N", paste0(name, "_freq"))
+  
+  data[, (name) := NULL]}
+  data<-as_task_classif(data,target=task$target_names)
+  return(data)
+}
+
+
+
+data_enco<-frequency_encode(task)
+data_enco$data()
+```
+
+
+
+We can see above the encoding
+
+#########
+let now do the nested cross validation to see how it perform our task
+```{r}
+learner <-lrn("classif.ranger",
+              mtry.ratio = to_tune(0.1, 1),
+              min.node.size = to_tune(1, 50),
+              predict_type = "prob"
+) %>% 
+  as_learner() %>% 
+  auto_tuner(
+    tuner = tnr("grid_search", batch_size=25),
+    learner = .,
+    resampling = rsmp("cv", folds=5),
+    measure = msr("classif.ce")
+  )
+
+ rs <- rsmp("cv", folds = 3)
+
+ rr <- resample(data_enco, learner, rs, store_models = TRUE)
+```
+
+
+```{r}
+measured<-list(msr("classif.ce"),msr("classif.acc"),msr('time_train'),msr("time_predict"),msr("time_both") )
+ perf <- rr$aggregate( measured)
+perf
+
+```
+
+```{r}
+mlr3viz::autoplot(rr)
+```
+
+We can see that the classification error looks same like the previous one but in term of computationaly time it is faster.
+
+Thank you
